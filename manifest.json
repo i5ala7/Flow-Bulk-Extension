@@ -1,25 +1,40 @@
 {
   "manifest_version": 3,
   "name": "Flow Bulk Generator",
-  "version": "2.1",
-  "description": "Bulk image generation for Google Flow",
-  "permissions": ["activeTab", "scripting", "downloads", "sidePanel", "storage"],
-  "host_permissions": ["https://labs.google/*"],
-  "background": {
-    "service_worker": "background.js",
-    "type": "module"
-  },
-  "action": {
-    "default_title": "Flow Bulk Generator"
-  },
+  "version": "1.2",
+  "description": "Minimal bulk image generator for Google Labs Flow.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "sidePanel",
+    "offscreen",
+    "power"
+  ],
+  "host_permissions": [
+    "https://labs.google/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "alwaysActive.js",
+        "alwaysActiveIsolated.js"
+      ],
+      "matches": ["https://labs.google/*"]
+    }
+  ],
   "side_panel": {
     "default_path": "sidepanel.html"
   },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {},
   "content_scripts": [
     {
-      "matches": ["https://labs.google/fx/tools/flow*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
+      "matches": ["https://labs.google/fx*"],
+      "js": ["content.js"]
     }
   ]
 }

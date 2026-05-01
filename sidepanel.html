@@ -117,11 +117,39 @@
     #stopBtn:hover { background-color: var(--red-hover); }
 
     #status {
-      margin-top: 12px;
+      margin-top: 8px;
       font-size: 13px;
       text-align: center;
       color: var(--text-muted);
       min-height: 20px;
+    }
+    .progress-section {
+      margin-top: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .progress-stats {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    progress {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 8px;
+      border: none;
+    }
+    progress::-webkit-progress-bar {
+      background-color: var(--border);
+      border-radius: 4px;
+    }
+    progress::-webkit-progress-value {
+      background-color: var(--primary);
+      border-radius: 4px;
+      transition: width 0.3s ease;
     }
   </style>
 </head>
@@ -158,7 +186,17 @@
     <button id="stopBtn" style="display:none;">Stop</button>
   </div>
   
-  <div id="status">Ready</div>
+  <div class="progress-section">
+    <div class="progress-stats">
+      <span id="promptCount">0 Prompts</span>
+      <span>
+        <span id="successCount" style="color: var(--emerald); margin-right: 8px;">0 ✓</span>
+        <span id="failCount" style="color: var(--red);">0 ✗</span>
+      </span>
+    </div>
+    <progress id="progressBar" value="0" max="100"></progress>
+    <div id="status">Ready</div>
+  </div>
 
   <script src="sidepanel.js"></script>
 </body>

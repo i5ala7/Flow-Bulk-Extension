@@ -1,7 +1,40 @@
 // Enable side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
 
-// Helper function to be safely injected into the page's MAIN world
+// -------------------------------------------------------------
+// OFFSCREEN DOCUMENT SETUP (Keeps Service Worker Awake)
+// -------------------------------------------------------------
+let offscreenDocPromise = null;
+
+async function setupOffscreenDocument() {
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html');
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [offscreenUrl]
+  });
+
+  if (existingContexts.length > 0) return;
+
+  if (offscreenDocPromise) {
+    await offscreenDocPromise;
+    return;
+  }
+
+  offscreenDocPromise = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'Keep background service worker alive during long generation loops'
+  });
+  await offscreenDocPromise;
+  offscreenDocPromise = null;
+}
+
+chrome.runtime.onInstalled.addListener(setupOffscreenDocument);
+chrome.runtime.onStartup.addListener(setupOffscreenDocument);
+
+// -------------------------------------------------------------
+// SLATE / REACT PROMPT FILLER
+// -------------------------------------------------------------
 function fillPromptReact(text) {
   try {
     const editor = document.querySelector('[contenteditable="true"][data-slate-editor="true"]');
@@ -24,7 +57,6 @@ function fillPromptReact(text) {
 
     editor.focus();
 
-    // Select all existing text safely using Slate's internal selection
     const lastIdx = Math.max(0, slate.children.length - 1);
     const lastChild = slate.children[lastIdx];
     const lastOffset = (lastChild && lastChild.children && lastChild.children[0])
@@ -35,10 +67,7 @@ function fillPromptReact(text) {
       focus:  { path: [lastIdx, 0], offset: lastOffset }
     });
     
-    // Safely replace text via Slate directly
     slate.insertText(text);
-    
-    // Force DOM event to ensure any wrappers catch the change
     editor.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
 
     return { success: true };
@@ -47,14 +76,45 @@ function fillPromptReact(text) {
   }
 }
 
+// -------------------------------------------------------------
+// MESSAGE LISTENER
+// -------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'KEEP_ALIVE') {
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // Inject Anti-Throttling files into the page just like the original extension
+  if (request.action === 'INJECT_ANTI_THROTTLING') {
+    chrome.power.requestKeepAwake('system');
+    Promise.all([
+      chrome.scripting.executeScript({
+        target: { tabId: sender.tab.id },
+        files: ['alwaysActive.js'],
+        world: 'MAIN'
+      }).catch(() => null),
+      chrome.scripting.executeScript({
+        target: { tabId: sender.tab.id },
+        files: ['alwaysActiveIsolated.js'],
+        world: 'ISOLATED'
+      }).catch(() => null)
+    ]).then(() => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (request.action === 'BULK_FINISHED') {
+    chrome.power.releaseKeepAwake();
+    return false;
+  }
+
   if (request.action === 'DOWNLOAD_IMAGE') {
     const { url, index } = request;
     const promptNumber = index + 1;
     const formattedIndex = promptNumber.toString().padStart(2, '0');
     const filename = `bulk images/${formattedIndex}.png`;
-
-    console.log(`[Background] Downloading image ${formattedIndex}...`);
 
     chrome.downloads.download({
       url: url,
@@ -63,21 +123,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       conflictAction: 'overwrite'
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
-        console.error(`[Background] Download failed:`, chrome.runtime.lastError);
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else {
-        console.log(`[Background] Download started with ID: ${downloadId}. Waiting for completion...`);
-        
-        // Listen for the download to finish
         const downloadListener = (delta) => {
           if (delta.id === downloadId && delta.state) {
             if (delta.state.current === 'complete') {
               chrome.downloads.onChanged.removeListener(downloadListener);
-              console.log(`[Background] Download ${downloadId} completed.`);
               sendResponse({ success: true, downloadId });
             } else if (delta.state.current === 'interrupted') {
               chrome.downloads.onChanged.removeListener(downloadListener);
-              console.error(`[Background] Download ${downloadId} interrupted.`);
               sendResponse({ success: false, error: 'Download interrupted' });
             }
           }
@@ -85,8 +139,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.downloads.onChanged.addListener(downloadListener);
       }
     });
-
-    return true; // Keep the message channel open to sendResponse asynchronously
+    return true; 
   }
   
   if (request.action === 'FILL_PROMPT') {
@@ -97,7 +150,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       args: [request.text]
     }, (results) => {
       if (chrome.runtime.lastError) {
-        console.error('[Background] Scripting error:', chrome.runtime.lastError);
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else if (results && results[0]) {
         sendResponse(results[0].result);
@@ -105,7 +157,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, error: 'Unknown execution error' });
       }
     });
-    
     return true;
   }
 });

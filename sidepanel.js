@@ -30,6 +30,11 @@ function setUIState(state) {
   }
 }
 
+document.getElementById('prompts').addEventListener('input', (e) => {
+  const prompts = e.target.value.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+  document.getElementById('promptCount').textContent = `${prompts.length} Prompts`;
+});
+
 document.getElementById('startBtn').addEventListener('click', async () => {
   const promptsText = document.getElementById('prompts').value;
   const model = document.getElementById('model').value;
@@ -51,6 +56,11 @@ document.getElementById('startBtn').addEventListener('click', async () => {
 
   targetTabId = tab.id;
   setUIState('RUNNING');
+
+  document.getElementById('progressBar').value = 0;
+  document.getElementById('progressBar').max = prompts.length;
+  document.getElementById('successCount').textContent = '0 ✓';
+  document.getElementById('failCount').textContent = '0 ✗';
 
   chrome.tabs.sendMessage(targetTabId, {
     action: 'START_BULK',
@@ -92,5 +102,14 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'BULK_FINISHED') {
     document.getElementById('status').textContent = 'Finished generating.';
     setUIState('IDLE');
+  } else if (msg.action === 'PROGRESS_UPDATE') {
+    document.getElementById('progressBar').value = msg.index + 1;
+    if (msg.success) {
+      const successCount = parseInt(document.getElementById('successCount').textContent);
+      document.getElementById('successCount').textContent = `${successCount + 1} ✓`;
+    } else {
+      const failCount = parseInt(document.getElementById('failCount').textContent);
+      document.getElementById('failCount').textContent = `${failCount + 1} ✗`;
+    }
   }
 });

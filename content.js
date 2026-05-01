@@ -1,6 +1,6 @@
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-let controlState = 'IDLE'; // IDLE, RUNNING, PAUSED
+let controlState = 'IDLE'; 
 
 async function waitWhilePaused() {
   while (controlState === 'PAUSED') {
@@ -129,7 +129,6 @@ async function setModelOptions(modelName, aspectRatio) {
     }
   }
 
-  // Ensure x1 is selected to avoid generating multiple images per prompt and messing up the sequence
   const x1Btn = [...document.querySelectorAll('button, [role="menuitem"]')].find(btn => 
     btn.offsetParent !== null && 
     ((btn.id && btn.id.includes('trigger-1')) || 
@@ -162,107 +161,182 @@ async function blobToBase64(url) {
   }
 }
 
-async function startBulk(prompts, modelName, aspectRatio) {
-  console.log('[FlowBulk] Starting bulk generation with', prompts.length, 'prompts.');
-  
-  for (let i = 0; i < prompts.length; i++) {
-    const prompt = prompts[i];
-    console.log(`[FlowBulk] --- Processing ${i+1}/${prompts.length} ---`);
-    console.log(`[FlowBulk] Prompt: "${prompt}"`);
-    
-    try {
-      await waitWhilePaused();
-      
-      await fillPrompt(prompt);
-      await sleep(800);
-      
-      await waitWhilePaused();
-      await setModelOptions(modelName, aspectRatio);
-      
-      const submitBtn = await waitForSubmitEnabled();
-      if (!submitBtn) {
-        console.error('[FlowBulk] Submit button is disabled or not found! Aborting loop.');
+// -------------------------------------------------------------
+// KEEP-ALIVE HEARTBEAT  —  prevents Chrome from throttling
+// the content-script's timers when the tab is hidden (RDP disconnect).
+// Sends a lightweight message to the background every 15 s.
+// Also re-injects alwaysActive scripts every 60 s as a safety net.
+// -------------------------------------------------------------
+let keepAliveInterval = null;
+let reInjectInterval = null;
+
+function startKeepAlive() {
+  if (keepAliveInterval) return;
+  keepAliveInterval = setInterval(() => {
+    chrome.runtime.sendMessage({ action: 'KEEP_ALIVE' }).catch(() => {});
+  }, 15000);
+  reInjectInterval = setInterval(() => {
+    chrome.runtime.sendMessage({ action: 'INJECT_ANTI_THROTTLING' }).catch(() => {});
+  }, 60000);
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+  if (reInjectInterval) { clearInterval(reInjectInterval); reInjectInterval = null; }
+}
+
+// -------------------------------------------------------------
+// SINGLE-PROMPT GENERATION ATTEMPT
+// Returns true on success, throws on failure.
+// -------------------------------------------------------------
+async function generateSinglePrompt(prompt, index) {
+  await waitWhilePaused();
+  await fillPrompt(prompt);
+  await sleep(800);
+
+  const submitBtn = await waitForSubmitEnabled(10000);
+  if (!submitBtn) {
+    throw new Error('Submit button is disabled or not found');
+  }
+
+  const existingTileIds = new Set(
+    [...document.querySelectorAll('[data-tile-id]')].map(el => el.getAttribute('data-tile-id'))
+  );
+
+  await waitWhilePaused();
+  await simulateClick(submitBtn);
+  console.log(`[FlowBulk] Clicked generate for prompt ${index + 1}. Waiting for result...`);
+
+  let newTile = null;
+  let targetUrl = null;
+  let pollCount = 0;
+  const MAX_POLL = 150; // 150 × 2 s = 5 min max wait
+
+  while (pollCount < MAX_POLL) {
+    await waitWhilePaused();
+    await sleep(2000);
+
+    // Detect new tile
+    if (!newTile) {
+      const currentTiles = document.querySelectorAll('[data-tile-id]');
+      for (const tile of currentTiles) {
+        const id = tile.getAttribute('data-tile-id');
+        if (id && !existingTileIds.has(id)) {
+          newTile = tile;
+          console.log(`[FlowBulk] Detected new tile ID: ${id}`);
+          break;
+        }
+      }
+    }
+
+    if (newTile) {
+      const img = newTile.querySelector('img[src]');
+      const text = (newTile.textContent || '').toLowerCase();
+
+      // Detect policy / safety / error failures in tile text
+      if (text.includes('policy') || text.includes('couldn\'t') || text.includes('unable') || text.includes('violat') || text.includes('safety')) {
+        throw new Error('Policy or generation error detected in tile');
+      }
+
+      // Image is ready when it has a valid src and no percentage spinner
+      if (img && img.src.length > 5 && !text.match(/\d+%/)) {
+        targetUrl = img.src;
         break;
       }
-      
-      // Snapshot existing tiles before clicking generate
-      const existingTileIds = new Set(
-        [...document.querySelectorAll('[data-tile-id]')].map(el => el.getAttribute('data-tile-id'))
-      );
-      
-      await waitWhilePaused();
-      await simulateClick(submitBtn);
-      console.log('[FlowBulk] Clicked generate. Waiting for a new tile to finish...');
-      
-      let newTile = null;
-      let targetUrl = null;
-      let attempts = 0;
-      
-      while (attempts < 150) { // Timeout after ~5 minutes
-        await waitWhilePaused();
-        await sleep(2000);
-        
-        // 1. Identify the newly added tile
-        if (!newTile) {
-          const currentTiles = document.querySelectorAll('[data-tile-id]');
-          for (const tile of currentTiles) {
-            const id = tile.getAttribute('data-tile-id');
-            if (id && !existingTileIds.has(id)) {
-              newTile = tile;
-              console.log(`[FlowBulk] Detected new tile ID: ${id}`);
-              break;
-            }
-          }
-        }
-        
-        // 2. Wait for the new tile to finish generating
-        if (newTile) {
-          const img = newTile.querySelector('img[src]');
-          const text = newTile.textContent || '';
-          
-          // Image exists, string is not empty, and no percentage loader text
-          if (img && img.src.length > 5 && !text.match(/\d+%/)) {
-            targetUrl = img.src;
-            break;
-          }
-        }
-        attempts++;
-      }
-      
-      // 3. Sequential Downloading
-      if (targetUrl) {
-        console.log(`[FlowBulk] Generation successful! Downloading specific image...`);
-        let downloadUrl = targetUrl;
-        
-        if (targetUrl.startsWith('blob:')) {
-          downloadUrl = await blobToBase64(targetUrl) || targetUrl;
-        }
-        
-        // PAUSE execution until the download actually finishes
-        await downloadImageSequence(downloadUrl, i);
-        console.log(`[FlowBulk] Download complete. Moving to next prompt in 2 seconds...`);
-        
-      } else {
-        console.error(`[FlowBulk] Timeout waiting for generation of prompt: ${prompt}`);
-      }
-      
-      // 4. Exact wait of 2 seconds before the next loop
-      await sleep(2000);
-      
-    } catch (e) {
-      if (e.message === 'USER_STOPPED') {
-          console.log('[FlowBulk] User stopped the generation.');
-          break;
-      }
-      console.error(`[FlowBulk] Error during prompt ${i+1}:`, e);
     }
+    pollCount++;
   }
-  
-  console.log('[FlowBulk] Bulk generation finished or stopped.');
+
+  if (!targetUrl) {
+    throw new Error('Timeout waiting for generation');
+  }
+
+  let downloadUrl = targetUrl;
+  if (targetUrl.startsWith('blob:')) {
+    downloadUrl = await blobToBase64(targetUrl) || targetUrl;
+  }
+  await downloadImageSequence(downloadUrl, index);
+  return true;
+}
+
+// -------------------------------------------------------------
+// MAIN BULK LOOP
+// -------------------------------------------------------------
+async function startBulk(prompts, modelName, aspectRatio) {
+  // Inject anti-throttling scripts once at the start
+  await new Promise(resolve => {
+    chrome.runtime.sendMessage({ action: 'INJECT_ANTI_THROTTLING' }, resolve);
+  });
+
+  // Start content-script-level keep-alive heartbeat
+  startKeepAlive();
+
+  console.log('[FlowBulk] Starting bulk generation with', prompts.length, 'prompts.');
+
+  // ---------- Set model/ratio ONCE before the loop ----------
+  try {
+    await setModelOptions(modelName, aspectRatio);
+  } catch (e) {
+    console.error('[FlowBulk] Failed to set model options:', e);
+  }
+
+  // ---------- Process each prompt ----------
+  for (let i = 0; i < prompts.length; i++) {
+    // Check if the user stopped before even starting the next prompt
+    if (controlState === 'IDLE') break;
+
+    const prompt = prompts[i];
+    console.log(`[FlowBulk] --- Processing ${i + 1}/${prompts.length} ---`);
+
+    let promptSuccess = false;
+    const MAX_RETRIES = 2;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await generateSinglePrompt(prompt, i);
+        promptSuccess = true;
+        break; // success — no need to retry
+      } catch (e) {
+        if (e.message === 'USER_STOPPED') {
+          console.log('[FlowBulk] User stopped the generation.');
+          chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: i, success: false });
+          // Jump straight to cleanup
+          stopKeepAlive();
+          controlState = 'IDLE';
+          chrome.runtime.sendMessage({ action: 'BULK_FINISHED' });
+          return;
+        }
+        console.warn(`[FlowBulk] Prompt ${i + 1} attempt ${attempt} failed:`, e.message);
+        if (attempt < MAX_RETRIES) {
+          console.log(`[FlowBulk] Retrying prompt ${i + 1}...`);
+          await sleep(3000);
+        }
+      }
+    }
+
+    // Report progress regardless of outcome
+    chrome.runtime.sendMessage({
+      action: 'PROGRESS_UPDATE',
+      index: i,
+      success: promptSuccess
+    });
+
+    if (!promptSuccess) {
+      console.error(`[FlowBulk] Prompt ${i + 1} failed after ${MAX_RETRIES} attempts. Skipping to next.`);
+    }
+
+    await sleep(2000);
+  }
+
+  console.log('[FlowBulk] Bulk generation finished.');
+  stopKeepAlive();
   controlState = 'IDLE';
   chrome.runtime.sendMessage({ action: 'BULK_FINISHED' });
 }
 
+// -------------------------------------------------------------
+// MESSAGE LISTENER
+// -------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'START_BULK') {
     if (controlState !== 'IDLE') {
@@ -280,6 +354,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
   } else if (request.action === 'STOP') {
     controlState = 'IDLE';
+    stopKeepAlive();
     sendResponse({ success: true });
   }
 });

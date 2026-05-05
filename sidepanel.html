@@ -165,7 +165,7 @@
     <label for="model">Model</label>
     <select id="model">
       <option value="Nano Banana Pro">Nano Banana Pro</option>
-      <option value="Nano Banana 2">Nano Banana 2</option>
+      <option value="Nano Banana 2" selected>Nano Banana 2</option>
       <option value="Imagen 4">Imagen 4</option>
     </select>
   </div>
@@ -174,9 +174,30 @@
     <label for="aspectRatio">Aspect Ratio</label>
     <select id="aspectRatio">
       <option value="SQUARE">Square (1:1)</option>
-      <option value="LANDSCAPE">Landscape</option>
+      <option value="LANDSCAPE" selected>Landscape</option>
       <option value="PORTRAIT">Portrait</option>
     </select>
+  </div>
+  
+  <div class="form-group">
+    <label for="concurrentCount">Concurrent Batch Size</label>
+    <select id="concurrentCount">
+      <option value="1">1 (Sequential)</option>
+      <option value="2">2</option>
+      <option value="3">3</option>
+      <option value="4">4</option>
+      <option value="5" selected>5</option>
+      <option value="6">6</option>
+      <option value="7">7</option>
+      <option value="8">8</option>
+      <option value="9">9</option>
+      <option value="10">10</option>
+    </select>
+  </div>
+  
+  <div class="form-group" style="display: flex; align-items: center; gap: 8px;">
+    <input type="checkbox" id="resumeLast" style="width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary);">
+    <label for="resumeLast" style="margin-bottom: 0; cursor: pointer; user-select: none;">Resume from last downloaded image</label>
   </div>
   
   <div class="controls">
@@ -184,6 +205,10 @@
     <button id="pauseBtn" style="display:none;">Pause</button>
     <button id="resumeBtn" style="display:none;">Resume</button>
     <button id="stopBtn" style="display:none;">Stop</button>
+  </div>
+  
+  <div class="controls" style="margin-top: 10px;">
+    <button id="retryBtn" style="display:none; background-color: var(--amber);">Retry Failed</button>
   </div>
   
   <div class="progress-section">

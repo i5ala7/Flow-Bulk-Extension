@@ -82,14 +82,15 @@ function findSubmitButton() {
 }
 
 async function waitForSubmitEnabled(timeout = 5000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
+  let elapsed = 0;
+  while (elapsed < timeout) {
     await waitWhilePaused();
     const btn = findSubmitButton();
     if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && btn.getAttribute('data-state') !== 'disabled') {
       return btn;
     }
     await sleep(200);
+    elapsed += 200;
   }
   return null;
 }
@@ -189,7 +190,7 @@ function stopKeepAlive() {
 // SINGLE-PROMPT GENERATION ATTEMPT
 // Returns true on success, throws on failure.
 // -------------------------------------------------------------
-async function generateSinglePrompt(prompt, index) {
+async function submitPromptAndGetTileId(prompt, index) {
   await waitWhilePaused();
   await fillPrompt(prompt);
   await sleep(800);
@@ -205,44 +206,53 @@ async function generateSinglePrompt(prompt, index) {
 
   await waitWhilePaused();
   await simulateClick(submitBtn);
-  console.log(`[FlowBulk] Clicked generate for prompt ${index + 1}. Waiting for result...`);
+  console.log(`[FlowBulk] Clicked generate for prompt ${index + 1}. Waiting for tile...`);
 
-  let newTile = null;
+  let newTileId = null;
+  for (let i = 0; i < 50; i++) {
+    await waitWhilePaused();
+    await sleep(200);
+    const currentTiles = document.querySelectorAll('[data-tile-id]');
+    for (const tile of currentTiles) {
+      const id = tile.getAttribute('data-tile-id');
+      if (id && !existingTileIds.has(id)) {
+        newTileId = id;
+        break;
+      }
+    }
+    if (newTileId) break;
+  }
+
+  if (!newTileId) throw new Error('New tile did not appear after submission');
+  console.log(`[FlowBulk] Detected new tile ID for prompt ${index + 1}: ${newTileId}`);
+  return newTileId;
+}
+
+async function waitForTileAndDownload(tileId, index) {
   let targetUrl = null;
   let pollCount = 0;
-  const MAX_POLL = 150; // 150 × 2 s = 5 min max wait
+  const MAX_POLL = 150;
 
   while (pollCount < MAX_POLL) {
     await waitWhilePaused();
     await sleep(2000);
 
-    // Detect new tile
-    if (!newTile) {
-      const currentTiles = document.querySelectorAll('[data-tile-id]');
-      for (const tile of currentTiles) {
-        const id = tile.getAttribute('data-tile-id');
-        if (id && !existingTileIds.has(id)) {
-          newTile = tile;
-          console.log(`[FlowBulk] Detected new tile ID: ${id}`);
-          break;
-        }
-      }
+    const tile = document.querySelector(`[data-tile-id="${tileId}"]`);
+    if (!tile) {
+      pollCount++;
+      continue;
     }
 
-    if (newTile) {
-      const img = newTile.querySelector('img[src]');
-      const text = (newTile.textContent || '').toLowerCase();
+    const img = tile.querySelector('img[src]');
+    const text = (tile.textContent || '').toLowerCase();
 
-      // Detect policy / safety / error failures in tile text
-      if (text.includes('policy') || text.includes('couldn\'t') || text.includes('unable') || text.includes('violat') || text.includes('safety')) {
-        throw new Error('Policy or generation error detected in tile');
-      }
+    if (text.includes('policy') || text.includes('couldn\'t') || text.includes('unable') || text.includes('violat') || text.includes('safety')) {
+      throw new Error('Policy or generation error detected in tile');
+    }
 
-      // Image is ready when it has a valid src and no percentage spinner
-      if (img && img.src.length > 5 && !text.match(/\d+%/)) {
-        targetUrl = img.src;
-        break;
-      }
+    if (img && img.src.length > 5 && !text.match(/\d+%/)) {
+      targetUrl = img.src;
+      break;
     }
     pollCount++;
   }
@@ -262,7 +272,7 @@ async function generateSinglePrompt(prompt, index) {
 // -------------------------------------------------------------
 // MAIN BULK LOOP
 // -------------------------------------------------------------
-async function startBulk(prompts, modelName, aspectRatio) {
+async function startBulk(prompts, modelName, aspectRatio, concurrentCount = 1, resumeLast = false, targetIndices = null) {
   // Inject anti-throttling scripts once at the start
   await new Promise(resolve => {
     chrome.runtime.sendMessage({ action: 'INJECT_ANTI_THROTTLING' }, resolve);
@@ -273,6 +283,25 @@ async function startBulk(prompts, modelName, aspectRatio) {
 
   console.log('[FlowBulk] Starting bulk generation with', prompts.length, 'prompts.');
 
+  const indicesToProcess = targetIndices || prompts.map((_, i) => i);
+  let startIndex = 0;
+
+  if (resumeLast && !targetIndices) {
+    const response = await new Promise(resolve => {
+      chrome.runtime.sendMessage({ action: 'GET_LAST_DOWNLOAD_INDEX' }, resolve);
+    });
+    if (response && response.maxIndex > 0) {
+      startIndex = response.maxIndex;
+      console.log(`[FlowBulk] Resuming from prompt ${startIndex + 1} (found up to index ${startIndex})`);
+      // Update the UI immediately for skipped prompts
+      for (let i = 0; i < startIndex && i < prompts.length; i++) {
+        chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: i, success: true });
+      }
+    }
+  }
+
+  const actualIndices = indicesToProcess.slice(startIndex);
+
   // ---------- Set model/ratio ONCE before the loop ----------
   try {
     await setModelOptions(modelName, aspectRatio);
@@ -281,51 +310,73 @@ async function startBulk(prompts, modelName, aspectRatio) {
   }
 
   // ---------- Process each prompt ----------
-  for (let i = 0; i < prompts.length; i++) {
-    // Check if the user stopped before even starting the next prompt
+  for (let i = 0; i < actualIndices.length; i += concurrentCount) {
     if (controlState === 'IDLE') break;
 
-    const prompt = prompts[i];
-    console.log(`[FlowBulk] --- Processing ${i + 1}/${prompts.length} ---`);
+    const batchSize = Math.min(concurrentCount, actualIndices.length - i);
+    const batchTiles = [];
 
-    let promptSuccess = false;
-    const MAX_RETRIES = 2;
+    // 1. Submit prompts in the batch
+    for (let j = 0; j < batchSize; j++) {
+      if (controlState === 'IDLE') break;
+      const promptIndex = actualIndices[i + j];
+      const prompt = prompts[promptIndex];
+      
+      console.log(`[FlowBulk] --- Submitting ${promptIndex + 1}/${prompts.length} ---`);
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        await generateSinglePrompt(prompt, i);
-        promptSuccess = true;
-        break; // success — no need to retry
-      } catch (e) {
-        if (e.message === 'USER_STOPPED') {
-          console.log('[FlowBulk] User stopped the generation.');
-          chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: i, success: false });
-          // Jump straight to cleanup
-          stopKeepAlive();
-          controlState = 'IDLE';
-          chrome.runtime.sendMessage({ action: 'BULK_FINISHED' });
-          return;
+      let tileId = null;
+      let promptSuccess = false;
+      const MAX_RETRIES = 2;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          tileId = await submitPromptAndGetTileId(prompt, promptIndex);
+          promptSuccess = true;
+          break; 
+        } catch (e) {
+          if (e.message === 'USER_STOPPED') {
+             console.log('[FlowBulk] User stopped the generation.');
+             break;
+          }
+          console.warn(`[FlowBulk] Submission failed for prompt ${promptIndex + 1} attempt ${attempt}:`, e.message);
+          if (attempt < MAX_RETRIES) {
+            await sleep(3000);
+          }
         }
-        console.warn(`[FlowBulk] Prompt ${i + 1} attempt ${attempt} failed:`, e.message);
-        if (attempt < MAX_RETRIES) {
-          console.log(`[FlowBulk] Retrying prompt ${i + 1}...`);
-          await sleep(3000);
-        }
+      }
+
+      if (promptSuccess && tileId) {
+        batchTiles.push({ tileId, index: promptIndex });
+      } else if (controlState !== 'IDLE') {
+        chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: promptIndex, success: false });
+      }
+
+      // Delay between submissions in a batch
+      if (j < batchSize - 1 && controlState !== 'IDLE') {
+        await sleep(2500); 
       }
     }
 
-    // Report progress regardless of outcome
-    chrome.runtime.sendMessage({
-      action: 'PROGRESS_UPDATE',
-      index: i,
-      success: promptSuccess
+    if (controlState === 'IDLE') break;
+
+    // 2. Wait for all submitted tiles to generate and download
+    const waitPromises = batchTiles.map(async (item) => {
+      try {
+        await waitForTileAndDownload(item.tileId, item.index);
+        chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: item.index, success: true });
+      } catch (e) {
+        if (e.message === 'USER_STOPPED') return;
+        console.error(`[FlowBulk] Generation failed for prompt ${item.index + 1}:`, e.message);
+        chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', index: item.index, success: false });
+      }
     });
 
-    if (!promptSuccess) {
-      console.error(`[FlowBulk] Prompt ${i + 1} failed after ${MAX_RETRIES} attempts. Skipping to next.`);
-    }
+    await Promise.all(waitPromises);
 
-    await sleep(2000);
+    // 3. Sleep before next batch
+    if (i + batchSize < actualIndices.length && controlState !== 'IDLE') {
+       await sleep(4000);
+    }
   }
 
   console.log('[FlowBulk] Bulk generation finished.');
@@ -344,7 +395,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
     }
     controlState = 'RUNNING';
-    startBulk(request.prompts, request.model, request.aspectRatio);
+    startBulk(request.prompts, request.model, request.aspectRatio, request.concurrentCount, request.resumeLast, request.targetIndices);
     sendResponse({ success: true });
   } else if (request.action === 'PAUSE') {
     controlState = 'PAUSED';

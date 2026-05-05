@@ -110,6 +110,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
+  if (request.action === 'GET_LAST_DOWNLOAD_INDEX') {
+    chrome.downloads.search({}, (items) => {
+      let maxIndex = 0;
+      for (const item of items) {
+        if (item.exists && item.filename && item.filename.includes('bulk images')) {
+          const match = item.filename.match(/bulk images[\\/](\d+)\.[a-zA-Z0-9]+$/i);
+          if (match) {
+            maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
+          }
+        }
+      }
+      sendResponse({ maxIndex });
+    });
+    return true;
+  }
+
   if (request.action === 'DOWNLOAD_IMAGE') {
     const { url, index } = request;
     const promptNumber = index + 1;

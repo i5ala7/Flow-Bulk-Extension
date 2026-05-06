@@ -232,21 +232,41 @@ async function waitForTileAndDownload(tileId, index) {
   let targetUrl = null;
   let pollCount = 0;
   const MAX_POLL = 150;
+  let missingCount = 0;
 
   while (pollCount < MAX_POLL) {
     await waitWhilePaused();
     await sleep(2000);
 
+    // Check for blocking error dialogs
+    const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog, .mat-mdc-dialog-container');
+    for (const d of dialogs) {
+      if (!d.offsetParent) continue; // skip hidden
+      const dText = (d.textContent || '').toLowerCase();
+      if (dText.includes('policy') || dText.includes('couldn\'t') || dText.includes('unable') || dText.includes('violat') || dText.includes('safety') || dText.includes('error')) {
+        const closeBtn = d.querySelector('button');
+        if (closeBtn) {
+          try { closeBtn.click(); } catch(e){}
+        }
+        throw new Error('Error dialog detected during generation');
+      }
+    }
+
     const tile = document.querySelector(`[data-tile-id="${tileId}"]`);
     if (!tile) {
+      missingCount++;
+      if (missingCount >= 4) {
+        throw new Error('Tile removed from DOM (likely generation failed)');
+      }
       pollCount++;
       continue;
     }
+    missingCount = 0;
 
     const img = tile.querySelector('img[src]');
     const text = (tile.textContent || '').toLowerCase();
 
-    if (text.includes('policy') || text.includes('couldn\'t') || text.includes('unable') || text.includes('violat') || text.includes('safety')) {
+    if (text.includes('policy') || text.includes('couldn\'t') || text.includes('unable') || text.includes('violat') || text.includes('safety') || text.includes('failed') || text.includes('error')) {
       throw new Error('Policy or generation error detected in tile');
     }
 
@@ -371,7 +391,7 @@ async function startBulk(prompts, modelName, aspectRatio, concurrentCount = 1, r
       }
     });
 
-    await Promise.all(waitPromises);
+    await Promise.allSettled(waitPromises);
 
     // 3. Sleep before next batch
     if (i + batchSize < actualIndices.length && controlState !== 'IDLE') {

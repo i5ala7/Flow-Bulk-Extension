@@ -67,6 +67,10 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   document.getElementById('successCount').textContent = '0 ✓';
   document.getElementById('failCount').textContent = '0 ✗';
 
+  if (!resumeLast) {
+    chrome.storage.local.set({ lastDownloadedIndex: 0 });
+  }
+
   chrome.tabs.sendMessage(targetTabId, {
     action: 'START_BULK',
     prompts: prompts,

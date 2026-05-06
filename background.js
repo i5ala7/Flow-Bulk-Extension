@@ -111,17 +111,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'GET_LAST_DOWNLOAD_INDEX') {
-    chrome.downloads.search({}, (items) => {
-      let maxIndex = 0;
-      for (const item of items) {
-        if (item.exists && item.filename && item.filename.includes('bulk images')) {
-          const match = item.filename.match(/bulk images[\\/](\d+)\.[a-zA-Z0-9]+$/i);
-          if (match) {
-            maxIndex = Math.max(maxIndex, parseInt(match[1], 10));
-          }
-        }
-      }
-      sendResponse({ maxIndex });
+    chrome.storage.local.get(['lastDownloadedIndex'], (result) => {
+      sendResponse({ maxIndex: result.lastDownloadedIndex || 0 });
     });
     return true;
   }
@@ -141,21 +132,52 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else {
+        let responded = false;
+        const completeResponse = (success, data) => {
+          if (!responded) {
+            responded = true;
+            if (success) {
+              chrome.storage.local.get(['lastDownloadedIndex'], (res) => {
+                const newMax = Math.max(res.lastDownloadedIndex || 0, promptNumber);
+                chrome.storage.local.set({ lastDownloadedIndex: newMax });
+              });
+            }
+            sendResponse(success ? { success: true, downloadId: data } : { success: false, error: data });
+          }
+        };
+
         const downloadListener = (delta) => {
           if (delta.id === downloadId && delta.state) {
             if (delta.state.current === 'complete') {
               chrome.downloads.onChanged.removeListener(downloadListener);
-              sendResponse({ success: true, downloadId });
+              completeResponse(true, downloadId);
             } else if (delta.state.current === 'interrupted') {
               chrome.downloads.onChanged.removeListener(downloadListener);
-              sendResponse({ success: false, error: 'Download interrupted' });
+              completeResponse(false, 'Download interrupted');
             }
           }
         };
         chrome.downloads.onChanged.addListener(downloadListener);
+        
+        // Safety check in case it completed before listener was added
+        setTimeout(() => {
+          if (!responded) {
+            chrome.downloads.search({ id: downloadId }, (items) => {
+              if (items && items[0]) {
+                if (items[0].state === 'complete') {
+                  chrome.downloads.onChanged.removeListener(downloadListener);
+                  completeResponse(true, downloadId);
+                } else if (items[0].state === 'interrupted') {
+                  chrome.downloads.onChanged.removeListener(downloadListener);
+                  completeResponse(false, 'Download interrupted early');
+                }
+              }
+            });
+          }
+        }, 500);
       }
     });
-    return true; 
+    return true;
   }
   
   if (request.action === 'FILL_PROMPT') {

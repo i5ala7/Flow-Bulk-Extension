@@ -10,7 +10,9 @@
     "storage",
     "sidePanel",
     "offscreen",
-    "power"
+    "power",
+    "debugger",
+    "tabs"
   ],
   "host_permissions": [
     "https://labs.google/*"

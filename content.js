@@ -10,14 +10,37 @@ async function waitWhilePaused() {
 }
 
 async function fillPrompt(text) {
+  // First, focus the editor so the debugger inserts text into the right field
+  const editor = document.querySelector('[contenteditable="true"][data-slate-editor="true"]');
+  if (editor) {
+    editor.focus();
+    // Select all existing text so the new text replaces it
+    const sel = window.getSelection();
+    if (sel) {
+      sel.selectAllChildren(editor);
+    }
+    await sleep(100);
+  }
+
+  // Use Chrome Debugger Protocol to insert text (browser-engine level input)
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({ action: 'FILL_PROMPT', text }, (response) => {
+    chrome.runtime.sendMessage({ action: 'CIT', text }, (response) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else if (response && response.success) {
         resolve();
       } else {
-        reject(new Error(response?.error || 'Unknown error filling prompt'));
+        // Fallback to legacy Slate-based approach
+        console.warn('[FlowBulk] Debugger text insert failed, trying legacy FILL_PROMPT...');
+        chrome.runtime.sendMessage({ action: 'FILL_PROMPT', text }, (fallbackResp) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else if (fallbackResp && fallbackResp.success) {
+            resolve();
+          } else {
+            reject(new Error(fallbackResp?.error || 'Unknown error filling prompt'));
+          }
+        });
       }
     });
   });
@@ -43,23 +66,39 @@ async function simulateClick(el) {
   await sleep(50);
   
   const rect = el.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height / 2;
-  const opts = { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy };
+  const cx = Math.round(rect.left + rect.width / 2);
+  const cy = Math.round(rect.top + rect.height / 2);
 
-  el.dispatchEvent(new PointerEvent('pointerover', opts));
-  el.dispatchEvent(new PointerEvent('pointerenter', opts));
-  el.dispatchEvent(new MouseEvent('mouseover', opts));
-  el.dispatchEvent(new MouseEvent('mouseenter', opts));
-  el.dispatchEvent(new PointerEvent('pointerdown', opts));
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  el.dispatchEvent(new PointerEvent('pointerup', opts));
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  el.dispatchEvent(new MouseEvent('click', opts));
-  
-  const id = el.id || '';
-  if (id.includes('trigger-IMAGE') || id.includes('trigger-VIDEO') || el.getAttribute('role') === 'tab') {
-    try { el.click(); } catch(e) {}
+  // Try debugger-based click first (browser-engine level, bypasses synthetic event rejection)
+  let debuggerSuccess = false;
+  try {
+    const result = await new Promise(resolve => {
+      chrome.runtime.sendMessage({ action: 'CC', x: cx, y: cy }, (resp) => {
+        resolve(resp);
+      });
+    });
+    debuggerSuccess = !!(result && result.success);
+  } catch (e) {
+    debuggerSuccess = false;
+  }
+
+  if (!debuggerSuccess) {
+    // Fallback: dispatch synthetic DOM events
+    const opts = { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy };
+    el.dispatchEvent(new PointerEvent('pointerover', opts));
+    el.dispatchEvent(new PointerEvent('pointerenter', opts));
+    el.dispatchEvent(new MouseEvent('mouseover', opts));
+    el.dispatchEvent(new MouseEvent('mouseenter', opts));
+    el.dispatchEvent(new PointerEvent('pointerdown', opts));
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new PointerEvent('pointerup', opts));
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.dispatchEvent(new MouseEvent('click', opts));
+    
+    const id = el.id || '';
+    if (id.includes('trigger-IMAGE') || id.includes('trigger-VIDEO') || el.getAttribute('role') === 'tab') {
+      try { el.click(); } catch(e) {}
+    }
   }
   await sleep(300);
 }
@@ -205,8 +244,23 @@ async function submitPromptAndGetTileId(prompt, index) {
   );
 
   await waitWhilePaused();
-  await simulateClick(submitBtn);
-  console.log(`[FlowBulk] Clicked generate for prompt ${index + 1}. Waiting for tile...`);
+
+  // Use Enter key 20% of the time as an alternative submission method
+  // (matches the working extension's approach)
+  if (Math.random() < 0.2) {
+    try {
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ action: 'CK', key: 'Enter', code: 'Enter', keyCode: 13 }, resolve);
+      });
+      console.log(`[FlowBulk] Submitted prompt ${index + 1} via Enter key.`);
+    } catch (e) {
+      console.warn('[FlowBulk] Enter key failed, falling back to click...');
+      await simulateClick(submitBtn);
+    }
+  } else {
+    await simulateClick(submitBtn);
+  }
+  console.log(`[FlowBulk] Submitted prompt ${index + 1}. Waiting for tile...`);
 
   let newTileId = null;
   for (let i = 0; i < 50; i++) {
@@ -293,6 +347,16 @@ async function waitForTileAndDownload(tileId, index) {
 // MAIN BULK LOOP
 // -------------------------------------------------------------
 async function startBulk(prompts, modelName, aspectRatio, concurrentCount = 1, resumeLast = false, targetIndices = null) {
+  // Attach Chrome Debugger Protocol to this tab (enables browser-level input)
+  try {
+    await new Promise(resolve => {
+      chrome.runtime.sendMessage({ action: 'CA' }, resolve);
+    });
+    console.log('[FlowBulk] Chrome Debugger attached successfully.');
+  } catch (e) {
+    console.warn('[FlowBulk] Failed to attach debugger:', e);
+  }
+
   // Inject anti-throttling scripts once at the start
   await new Promise(resolve => {
     chrome.runtime.sendMessage({ action: 'INJECT_ANTI_THROTTLING' }, resolve);

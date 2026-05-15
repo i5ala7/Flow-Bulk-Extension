@@ -33,7 +33,23 @@ chrome.runtime.onInstalled.addListener(setupOffscreenDocument);
 chrome.runtime.onStartup.addListener(setupOffscreenDocument);
 
 // -------------------------------------------------------------
-// SLATE / REACT PROMPT FILLER
+// CHROME DEBUGGER PROTOCOL — State Management
+// Tracks which tabs have the debugger attached.
+// -------------------------------------------------------------
+const debuggerAttachedTabs = new Set();
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  debuggerAttachedTabs.delete(tabId);
+});
+
+chrome.debugger.onDetach.addListener(source => {
+  if (source.tabId !== undefined) {
+    debuggerAttachedTabs.delete(source.tabId);
+  }
+});
+
+// -------------------------------------------------------------
+// SLATE / REACT PROMPT FILLER (kept as fallback)
 // -------------------------------------------------------------
 function fillPromptReact(text) {
   try {
@@ -180,6 +196,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  // Legacy Slate-based prompt fill (kept as fallback)
   if (request.action === 'FILL_PROMPT') {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
@@ -195,6 +212,158 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, error: 'Unknown execution error' });
       }
     });
+    return true;
+  }
+
+  // ---------------------------------------------------------
+  // CHROME DEBUGGER PROTOCOL HANDLERS
+  // These send input at the browser-engine level, bypassing
+  // any JavaScript-level synthetic event rejection by Flow.
+  // ---------------------------------------------------------
+
+  // CA — Attach debugger to the sender tab
+  if (request.action === 'CA') {
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return true;
+    }
+    (async () => {
+      const target = { tabId };
+      try {
+        await chrome.debugger.attach(target, '1.3');
+        debuggerAttachedTabs.add(tabId);
+        sendResponse({ success: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('already attached')) {
+          debuggerAttachedTabs.add(tabId);
+          sendResponse({ success: true });
+        } else {
+          sendResponse({ success: false, error: msg });
+        }
+      }
+    })();
+    return true;
+  }
+
+  // CD — Detach debugger from the sender tab
+  if (request.action === 'CD') {
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return true;
+    }
+    (async () => {
+      const target = { tabId };
+      try {
+        if (debuggerAttachedTabs.has(tabId)) {
+          await chrome.debugger.detach(target);
+          debuggerAttachedTabs.delete(tabId);
+        }
+        sendResponse({ success: true });
+      } catch (err) {
+        debuggerAttachedTabs.delete(tabId);
+        sendResponse({ success: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+
+  // CIT — Insert text via Chrome Debugger Protocol (Input.insertText)
+  if (request.action === 'CIT') {
+    const { text } = request;
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return true;
+    }
+    (async () => {
+      const target = { tabId };
+      try {
+        if (!debuggerAttachedTabs.has(tabId)) {
+          await chrome.debugger.attach(target, '1.3');
+          debuggerAttachedTabs.add(tabId);
+        }
+        await chrome.debugger.sendCommand(target, 'Input.insertText', { text });
+        sendResponse({ success: true });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+
+  // CK — Simulate key press via Chrome Debugger Protocol (Input.dispatchKeyEvent)
+  if (request.action === 'CK') {
+    const { key, keyCode, code } = request;
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return true;
+    }
+    (async () => {
+      const target = { tabId };
+      try {
+        if (!debuggerAttachedTabs.has(tabId)) {
+          await chrome.debugger.attach(target, '1.3');
+          debuggerAttachedTabs.add(tabId);
+        }
+        const params = {
+          key,
+          code,
+          windowsVirtualKeyCode: keyCode,
+          nativeVirtualKeyCode: keyCode
+        };
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...params });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...params });
+        sendResponse({ success: true });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+
+  // CC — Simulate mouse click via Chrome Debugger Protocol (Input.dispatchMouseEvent)
+  if (request.action === 'CC') {
+    const { x, y } = request;
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return true;
+    }
+    const target = { tabId };
+    // Add small random jitter like the working extension does
+    const jitter = () => Math.round(6 * (Math.random() - 0.5));
+    const cx = x + jitter();
+    const cy = y + jitter();
+
+    const performClick = async () => {
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x: cx, y: cy, button: 'none', modifiers: 0
+      });
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: cx, y: cy, button: 'left', buttons: 1, clickCount: 1, modifiers: 0
+      });
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: cx, y: cy, button: 'left', buttons: 0, clickCount: 1, modifiers: 0
+      });
+    };
+
+    (async () => {
+      try {
+        if (!debuggerAttachedTabs.has(tabId)) {
+          await chrome.debugger.attach(target, '1.3');
+          debuggerAttachedTabs.add(tabId);
+        }
+        await performClick();
+        sendResponse({ success: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendResponse({ success: false, error: msg });
+      }
+    })();
     return true;
   }
 });
